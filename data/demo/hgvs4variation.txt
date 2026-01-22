@@ -1,0 +1,3 @@
+VariationID	HGVS	Type
+10001	NM_000546.5:c.743G>A	nucleotide
+10001	NM_000546.5:p.Arg248Gln	protein
