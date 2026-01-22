@@ -1,6 +1,7 @@
 # clinvar-sclc-analyzer
 # clinvar-tool
 
+
 C++17 tool for ClinVar-driven variant analysis (VCF/VCF.gz) with HGVS mapping and optional gnomAD, COSMIC, TP53 functional and therapy annotations.
 
 The tool supports a dedicated **SCLC mode** focused on somatic pathogenic variants in **TP53/RB1**, as well as a **global mode** for exporting ClinVar + HGVS tables.
