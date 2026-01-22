@@ -1,0 +1,30 @@
+# build outputs
+/build/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# binaries
+clinvar_tool
+*.exe
+
+# results / large data
+/results/*.tsv
+/results/*.txt
+/results/*.gz
+/results/*.vcf
+/data/*.gz
+/data/clinvar/
+data/variant_summary.txt
+data/hgvs4variation.txt
+data/variation_allele.txt
+
+# editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
