@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it."
+title: "clinvar_tool"
+type: software
+authors:
+  - family-names: "Babiarz"
+    given-names: "Grzegorz"
+year: 2026
+license: "MIT"
+repository-code: 
+keywords:
+  - bioinformatics
+  - genomics
+  - ClinVar
+  - HGVS
+  - VCF
+  - TP53
+  - SCLC
+  - C++17
