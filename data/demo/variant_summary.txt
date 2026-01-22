@@ -1,0 +1,2 @@
+VariationID	GeneSymbol	ClinicalSignificance	Origin	Chromosome	Start	ReferenceAllele	AlternateAllele	PhenotypeList
+10001	TP53	Pathogenic	somatic	17	7579472	C	T	Small cell lung carcinoma
