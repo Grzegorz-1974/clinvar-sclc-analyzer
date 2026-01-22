@@ -1,0 +1,14 @@
+## clinvar_tool v0.1.0
+
+### Highlights
+- ClinVar-driven variant extraction and reporting (VCF/VCF.gz)
+- HGVS mapping (hgvs4variation + variation_allele)
+- `sclc` mode: TP53/RB1, somatic pathogenic(/likely pathogenic), lung/SCLC phenotype filtering
+- Optional annotations: gnomAD AF, COSMIC IDs/site/histology/count, TP53 functional notes, therapy evidence
+
+### Linux binary
+Build on Fedora/Linux:
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/clinvar_tool --help
