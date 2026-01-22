@@ -1,10 +1,18 @@
 // clinvar_tool.cpp
 // Analiza wariantów z VCF z użyciem ClinVar + gnomAD + COSMIC + TP53db + OncoKB/CIViC
-// Tryby: "sclc" (TP53/RB1, somatic P/LP, lung/SCLC) oraz "global"
+// Tryby:
+//   - "sclc"   : TP53/RB1, somatic, pathogenic(/likely pathogenic), fenotyp lung/SCLC, raport kliniczny TSV
+//   - "global" : zrzut ClinVar + HGVS (TP53/RB1 + HGVS) do TSV
 //
-// Kompilacja:
-//  - C++17
-//  - zlib (dla .gz)
+// Kompilacja (Fedora):
+//   g++ -std=c++17 -O2 src/clinvar_tool.cpp -o clinvar_tool -lz
+//
+// Wymaga: zlib-devel (nagłówki + libz)
+//   sudo dnf install -y zlib-devel
+//
+// Uwaga:
+//  - pliki wejściowe mogą być .txt lub .gz (LineReader obsługuje oba warianty)
+//  - jeśli nie chcesz użyć danej bazy opcjonalnej, podaj "-" zamiast ścieżki
 
 #include <algorithm>
 #include <cctype>
@@ -17,7 +25,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <zlib.h> // gzopen, gzgets, gzclose
+#include <zlib.h>  // gzopen, gzgets, gzclose
 
 // ==================== NARZĘDZIA POMOCNICZE ====================
 
@@ -38,14 +46,14 @@ static std::string trim(const std::string& s) {
 
 static std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
-        [](unsigned char c) { return (unsigned char)std::tolower(c); });
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
 }
 
 static std::string make_coord_key(const std::string& chr,
-    const std::string& pos,
-    const std::string& ref,
-    const std::string& alt) {
+                                  const std::string& pos,
+                                  const std::string& ref,
+                                  const std::string& alt) {
     return chr + ":" + pos + ":" + ref + ":" + alt;
 }
 
@@ -67,8 +75,7 @@ public:
         if (is_gz_) {
             gz_ = gzopen(path.c_str(), "rb");
             if (!gz_) throw std::runtime_error("Cannot open gz file: " + path);
-        }
-        else {
+        } else {
             in_.open(path);
             if (!in_) throw std::runtime_error("Cannot open file: " + path);
         }
@@ -110,7 +117,7 @@ private:
 
 struct ClinVarRecord {
     std::string variation_id;
-    std::string allele_id; // mapping z variation_allele.txt
+    std::string allele_id;  // z variation_allele.txt
     std::string gene_symbol;
     std::string clinical_significance;
     std::string origin;
@@ -122,8 +129,8 @@ struct ClinVarRecord {
 };
 
 struct HgvsInfo {
-    std::vector<std::string> nuc;  // HGVS nucleotide
-    std::vector<std::string> prot; // HGVS protein
+    std::vector<std::string> nuc;   // HGVS nukleotydowe
+    std::vector<std::string> prot;  // HGVS białkowe
 };
 
 struct GnomADInfo { std::string af; };
@@ -136,7 +143,7 @@ struct CosmicInfo {
 };
 
 struct TP53FuncInfo {
-    std::string classification;
+    std::string classification;  // np. pathogenic, LOF, DNE
     std::string func_score;
     std::string notes;
 };
@@ -145,7 +152,7 @@ struct TherapyInfo {
     std::string evidence_level;
     std::string drug;
     std::string disease;
-    std::string source;
+    std::string source;  // OncoKB / CIViC
 };
 
 // ==================== Filtr fenotypu SCLC / lung ====================
@@ -159,44 +166,54 @@ static bool is_sclc_or_lung(const std::string& phenotype_list) {
     return false;
 }
 
-// ==================== variation_allele: VariationID -> AlleleID ====================
+// ==================== ŁADOWANIE variation_allele: VariationID -> AlleleID ====================
 
 static std::unordered_map<std::string, std::string>
-load_variation_allele(const std::string& path) {
-    std::unordered_map<std::string, std::string> out;
-    if (path.empty() || path == "-") return out;
+load_variation_allele(const std::string& variation_allele_path) {
+    std::unordered_map<std::string, std::string> varid_to_alleleid;
+    if (variation_allele_path.empty() || variation_allele_path == "-") return varid_to_alleleid;
 
-    LineReader lr(path);
-    if (!lr.good()) return out;
-
+    LineReader lr(variation_allele_path);
     std::string header;
-    if (!lr.getline(header)) return out;
+    if (!lr.getline(header)) {
+        std::cerr << "WARN: variation_allele file empty\n";
+        return varid_to_alleleid;
+    }
 
-    auto h = split_tab(header);
-    std::unordered_map<std::string, size_t> idx;
-    for (size_t i = 0; i < h.size(); ++i) idx[h[i]] = i;
+    auto header_cols = split_tab(header);
+    std::unordered_map<std::string, size_t> col_idx;
+    for (size_t i = 0; i < header_cols.size(); ++i) col_idx[header_cols[i]] = i;
 
-    int iVar = idx.count("VariationID") ? (int)idx["VariationID"] : -1;
-    int iAll = idx.count("AlleleID") ? (int)idx["AlleleID"] : -1;
-    if (iVar < 0 || iAll < 0) return out;
+    auto get_idx = [&](const std::string& name) -> int {
+        auto it = col_idx.find(name);
+        if (it == col_idx.end()) return -1;
+        return (int)it->second;
+    };
+
+    int idx_VariationID = get_idx("VariationID");
+    int idx_AlleleID    = get_idx("AlleleID");
+    if (idx_VariationID < 0 || idx_AlleleID < 0) {
+        std::cerr << "WARN: VariationID / AlleleID not found in variation_allele header\n";
+        return varid_to_alleleid;
+    }
 
     std::string line;
     while (lr.getline(line)) {
         if (line.empty()) continue;
-        auto c = split_tab(line);
-        if ((int)c.size() <= std::max(iVar, iAll)) continue;
-        out[c[iVar]] = c[iAll];
+        auto cols = split_tab(line);
+        if ((int)cols.size() <= std::max(idx_VariationID, idx_AlleleID)) continue;
+        varid_to_alleleid[cols[idx_VariationID]] = cols[idx_AlleleID];
     }
-    return out;
+
+    return varid_to_alleleid;
 }
 
-// ==================== ClinVar: variant_summary (filtrowanie) ====================
+// ==================== ŁADOWANIE ClinVar z variant_summary (filtrowanie) ====================
 
 static std::unordered_map<std::string, ClinVarRecord>
 load_clinvar_filtered(const std::string& variant_summary_path,
-    const std::unordered_map<std::string, std::string>& varid_to_alleleid,
-    bool sclc_mode)
-{
+                      const std::unordered_map<std::string, std::string>& varid_to_alleleid,
+                      bool sclc_mode) {
     std::unordered_map<std::string, ClinVarRecord> result;
 
     LineReader lr(variant_summary_path);
@@ -219,17 +236,17 @@ load_clinvar_filtered(const std::string& variant_summary_path,
         auto it = col_idx.find(name);
         if (it == col_idx.end()) return -1;
         return (int)it->second;
-        };
+    };
 
-    int idx_VariationID = get_idx("VariationID");
-    int idx_GeneSymbol = get_idx("GeneSymbol");
+    int idx_VariationID          = get_idx("VariationID");
+    int idx_GeneSymbol           = get_idx("GeneSymbol");
     int idx_ClinicalSignificance = get_idx("ClinicalSignificance");
-    int idx_Origin = get_idx("Origin");
-    int idx_Chromosome = get_idx("Chromosome");
-    int idx_Start = get_idx("Start");
-    int idx_RefAllele = get_idx("ReferenceAllele");
-    int idx_AltAllele = get_idx("AlternateAllele");
-    int idx_Phenotype = get_idx("PhenotypeList");
+    int idx_Origin               = get_idx("Origin");
+    int idx_Chromosome           = get_idx("Chromosome");
+    int idx_Start                = get_idx("Start");
+    int idx_RefAllele            = get_idx("ReferenceAllele");
+    int idx_AltAllele            = get_idx("AlternateAllele");
+    int idx_Phenotype            = get_idx("PhenotypeList");
     if (idx_Phenotype < 0) idx_Phenotype = get_idx("Disease/Phenotype");
 
     if (idx_VariationID < 0 || idx_GeneSymbol < 0 ||
@@ -247,20 +264,24 @@ load_clinvar_filtered(const std::string& variant_summary_path,
         if ((int)cols.size() <= idx_AltAllele) continue;
 
         std::string variation_id = cols[idx_VariationID];
-        std::string gene_symbol = trim(cols[idx_GeneSymbol]);
-        std::string clinsig = trim(cols[idx_ClinicalSignificance]);
-        std::string origin = trim(cols[idx_Origin]);
-        std::string chrom = cols[idx_Chromosome];
-        std::string pos = cols[idx_Start];
-        std::string ref = cols[idx_RefAllele];
-        std::string alt = cols[idx_AltAllele];
-        std::string phen_list = (idx_Phenotype >= 0 && (int)cols.size() > idx_Phenotype)
-            ? cols[idx_Phenotype] : "";
+        std::string gene_symbol  = trim(cols[idx_GeneSymbol]);
+        std::string clinsig      = trim(cols[idx_ClinicalSignificance]);
+        std::string origin       = trim(cols[idx_Origin]);
+        std::string chrom        = cols[idx_Chromosome];
+        std::string pos          = cols[idx_Start];
+        std::string ref          = cols[idx_RefAllele];
+        std::string alt          = cols[idx_AltAllele];
+        std::string phen_list    = (idx_Phenotype >= 0 && (int)cols.size() > idx_Phenotype) ? cols[idx_Phenotype] : "";
 
         if (sclc_mode) {
             if (gene_symbol != "TP53" && gene_symbol != "RB1") continue;
-            if (to_lower(origin).find("somatic") == std::string::npos) continue;
-            if (to_lower(clinsig).find("pathogenic") == std::string::npos) continue;
+
+            std::string origin_low = to_lower(origin);
+            if (origin_low.find("somatic") == std::string::npos) continue;
+
+            std::string clinsig_low = to_lower(clinsig);
+            if (clinsig_low.find("pathogenic") == std::string::npos) continue;
+
             if (idx_Phenotype >= 0 && !is_sclc_or_lung(phen_list)) continue;
         }
 
@@ -269,6 +290,7 @@ load_clinvar_filtered(const std::string& variant_summary_path,
         rec.allele_id = "";
         auto itA = varid_to_alleleid.find(variation_id);
         if (itA != varid_to_alleleid.end()) rec.allele_id = itA->second;
+
         rec.gene_symbol = gene_symbol;
         rec.clinical_significance = clinsig;
         rec.origin = origin;
@@ -284,12 +306,11 @@ load_clinvar_filtered(const std::string& variant_summary_path,
     return result;
 }
 
-// ==================== HGVS: hgvs4variation ====================
+// ==================== ŁADOWANIE HGVS (hgvs4variation) ====================
 
 static std::unordered_map<std::string, HgvsInfo>
 load_hgvs_for_variants(const std::string& hgvs4variation_path,
-    const std::unordered_set<std::string>& wanted_variation_ids)
-{
+                       const std::unordered_set<std::string>& wanted_variation_ids) {
     std::unordered_map<std::string, HgvsInfo> out;
 
     LineReader lr(hgvs4variation_path);
@@ -307,12 +328,11 @@ load_hgvs_for_variants(const std::string& hgvs4variation_path,
         auto it = col_idx.find(name);
         if (it == col_idx.end()) return -1;
         return (int)it->second;
-        };
+    };
 
     int idx_VariationID = get_idx("VariationID");
-    int idx_HGVS = get_idx("HGVS");
-    int idx_Type = get_idx("Type");
-
+    int idx_HGVS        = get_idx("HGVS");
+    int idx_Type        = get_idx("Type");
     if (idx_VariationID < 0 || idx_HGVS < 0 || idx_Type < 0) {
         std::cerr << "ERROR: required columns not found in hgvs4variation\n";
         return out;
@@ -341,7 +361,7 @@ load_hgvs_for_variants(const std::string& hgvs4variation_path,
     return out;
 }
 
-// ==================== gnomAD TSV ====================
+// ==================== ŁADOWANIE gnomAD TSV ====================
 
 static std::unordered_map<std::string, GnomADInfo>
 load_gnomad(const std::string& path) {
@@ -368,13 +388,13 @@ load_gnomad(const std::string& path) {
         auto it = col_idx.find(name);
         if (it == col_idx.end()) return -1;
         return (int)it->second;
-        };
+    };
 
     int idx_CHROM = get_idx("CHROM");
-    int idx_POS = get_idx("POS");
-    int idx_REF = get_idx("REF");
-    int idx_ALT = get_idx("ALT");
-    int idx_AF = get_idx("AF");
+    int idx_POS   = get_idx("POS");
+    int idx_REF   = get_idx("REF");
+    int idx_ALT   = get_idx("ALT");
+    int idx_AF    = get_idx("AF");
 
     if (idx_CHROM < 0 || idx_POS < 0 || idx_REF < 0 || idx_ALT < 0 || idx_AF < 0) {
         std::cerr << "WARN: missing columns in gnomAD TSV\n";
@@ -387,19 +407,14 @@ load_gnomad(const std::string& path) {
         auto cols = split_tab(line);
         if ((int)cols.size() <= idx_AF) continue;
 
-        std::string chr = cols[idx_CHROM];
-        std::string pos = cols[idx_POS];
-        std::string ref = cols[idx_REF];
-        std::string alt = cols[idx_ALT];
-        std::string af = cols[idx_AF];
-
-        out[make_coord_key(chr, pos, ref, alt)] = GnomADInfo{ af };
+        out[make_coord_key(cols[idx_CHROM], cols[idx_POS], cols[idx_REF], cols[idx_ALT])] =
+            GnomADInfo{ cols[idx_AF] };
     }
 
     return out;
 }
 
-// ==================== COSMIC TSV ====================
+// ==================== ŁADOWANIE COSMIC TSV ====================
 
 static std::unordered_map<std::string, CosmicInfo>
 load_cosmic(const std::string& path) {
@@ -426,15 +441,15 @@ load_cosmic(const std::string& path) {
         auto it = col_idx.find(name);
         if (it == col_idx.end()) return -1;
         return (int)it->second;
-        };
+    };
 
     int idx_CHROM = get_idx("CHROM");
-    int idx_POS = get_idx("POS");
-    int idx_REF = get_idx("REF");
-    int idx_ALT = get_idx("ALT");
-    int idx_IDS = get_idx("COSMIC_IDS");
-    int idx_SITE = get_idx("PRIMARY_SITE");
-    int idx_HIST = get_idx("HISTOLOGY");
+    int idx_POS   = get_idx("POS");
+    int idx_REF   = get_idx("REF");
+    int idx_ALT   = get_idx("ALT");
+    int idx_IDS   = get_idx("COSMIC_IDS");
+    int idx_SITE  = get_idx("PRIMARY_SITE");
+    int idx_HIST  = get_idx("HISTOLOGY");
     int idx_COUNT = get_idx("COUNT");
 
     if (idx_CHROM < 0 || idx_POS < 0 || idx_REF < 0 || idx_ALT < 0 ||
@@ -449,24 +464,19 @@ load_cosmic(const std::string& path) {
         auto cols = split_tab(line);
         if ((int)cols.size() <= idx_COUNT) continue;
 
-        std::string chr = cols[idx_CHROM];
-        std::string pos = cols[idx_POS];
-        std::string ref = cols[idx_REF];
-        std::string alt = cols[idx_ALT];
-
         CosmicInfo ci;
-        ci.ids = cols[idx_IDS];
+        ci.ids          = cols[idx_IDS];
         ci.primary_site = cols[idx_SITE];
-        ci.histology = cols[idx_HIST];
-        ci.count = cols[idx_COUNT];
+        ci.histology    = cols[idx_HIST];
+        ci.count        = cols[idx_COUNT];
 
-        out[make_coord_key(chr, pos, ref, alt)] = ci;
+        out[make_coord_key(cols[idx_CHROM], cols[idx_POS], cols[idx_REF], cols[idx_ALT])] = ci;
     }
 
     return out;
 }
 
-// ==================== TP53db TSV ====================
+// ==================== ŁADOWANIE TP53db TSV ====================
 
 static std::unordered_map<std::string, TP53FuncInfo>
 load_tp53db(const std::string& path) {
@@ -493,12 +503,12 @@ load_tp53db(const std::string& path) {
         auto it = col_idx.find(name);
         if (it == col_idx.end()) return -1;
         return (int)it->second;
-        };
+    };
 
     int idx_HGVS_P = get_idx("HGVS_P");
-    int idx_CLASS = get_idx("CLASS");
-    int idx_SCORE = get_idx("FUNC_SCORE");
-    int idx_NOTES = get_idx("NOTES");
+    int idx_CLASS  = get_idx("CLASS");
+    int idx_SCORE  = get_idx("FUNC_SCORE");
+    int idx_NOTES  = get_idx("NOTES");
 
     if (idx_HGVS_P < 0) {
         std::cerr << "WARN: TP53db must contain column HGVS_P\n";
@@ -511,20 +521,18 @@ load_tp53db(const std::string& path) {
         auto cols = split_tab(line);
         if ((int)cols.size() <= idx_HGVS_P) continue;
 
-        std::string hgvsp = cols[idx_HGVS_P];
-
         TP53FuncInfo info;
         info.classification = (idx_CLASS >= 0 && (int)cols.size() > idx_CLASS) ? cols[idx_CLASS] : "";
-        info.func_score = (idx_SCORE >= 0 && (int)cols.size() > idx_SCORE) ? cols[idx_SCORE] : "";
-        info.notes = (idx_NOTES >= 0 && (int)cols.size() > idx_NOTES) ? cols[idx_NOTES] : "";
+        info.func_score     = (idx_SCORE >= 0 && (int)cols.size() > idx_SCORE) ? cols[idx_SCORE] : "";
+        info.notes          = (idx_NOTES >= 0 && (int)cols.size() > idx_NOTES) ? cols[idx_NOTES] : "";
 
-        out[hgvsp] = info;
+        out[cols[idx_HGVS_P]] = info;
     }
 
     return out;
 }
 
-// ==================== Therapy TSV (OncoKB/CIViC) ====================
+// ==================== ŁADOWANIE Therapy TSV (OncoKB/CIViC) ====================
 
 static std::unordered_map<std::string, TherapyInfo>
 load_therapy(const std::string& path) {
@@ -551,13 +559,13 @@ load_therapy(const std::string& path) {
         auto it = col_idx.find(name);
         if (it == col_idx.end()) return -1;
         return (int)it->second;
-        };
+    };
 
     int idx_HGVS_P = get_idx("HGVS_P");
-    int idx_EVID = get_idx("EVIDENCE_LEVEL");
-    int idx_DRUG = get_idx("DRUG");
-    int idx_DIS = get_idx("DISEASE");
-    int idx_SRC = get_idx("SOURCE");
+    int idx_EVID   = get_idx("EVIDENCE_LEVEL");
+    int idx_DRUG   = get_idx("DRUG");
+    int idx_DIS    = get_idx("DISEASE");
+    int idx_SRC    = get_idx("SOURCE");
 
     if (idx_HGVS_P < 0) {
         std::cerr << "WARN: therapy TSV must contain HGVS_P\n";
@@ -570,15 +578,13 @@ load_therapy(const std::string& path) {
         auto cols = split_tab(line);
         if ((int)cols.size() <= idx_HGVS_P) continue;
 
-        std::string hgvsp = cols[idx_HGVS_P];
-
         TherapyInfo info;
         info.evidence_level = (idx_EVID >= 0 && (int)cols.size() > idx_EVID) ? cols[idx_EVID] : "";
-        info.drug = (idx_DRUG >= 0 && (int)cols.size() > idx_DRUG) ? cols[idx_DRUG] : "";
-        info.disease = (idx_DIS >= 0 && (int)cols.size() > idx_DIS) ? cols[idx_DIS] : "";
-        info.source = (idx_SRC >= 0 && (int)cols.size() > idx_SRC) ? cols[idx_SRC] : "";
+        info.drug           = (idx_DRUG >= 0 && (int)cols.size() > idx_DRUG) ? cols[idx_DRUG] : "";
+        info.disease        = (idx_DIS  >= 0 && (int)cols.size() > idx_DIS ) ? cols[idx_DIS ] : "";
+        info.source         = (idx_SRC  >= 0 && (int)cols.size() > idx_SRC ) ? cols[idx_SRC ] : "";
 
-        out[hgvsp] = info;
+        out[cols[idx_HGVS_P]] = info;
     }
 
     return out;
@@ -611,11 +617,11 @@ static void analyze_vcf_sclc(
         if ((int)cols.size() < 5) continue;
 
         std::string chrom = cols[0];
-        std::string pos = cols[1];
-        std::string ref = cols[3];
-        std::string alt = cols[4];
+        std::string pos   = cols[1];
+        std::string ref   = cols[3];
+        std::string alt_allele = cols[4];
 
-        std::string key = make_coord_key(chrom, pos, ref, alt);
+        std::string key = make_coord_key(chrom, pos, ref, alt_allele);
 
         auto it = clinvar_by_coord.find(key);
         if (it == clinvar_by_coord.end()) continue;
@@ -623,24 +629,23 @@ static void analyze_vcf_sclc(
         const ClinVarRecord& rec = it->second;
 
         std::string hgvs_nuc, hgvs_prot, primary_hgvsp;
-
         auto hg_it = hgvs_by_varid.find(rec.variation_id);
         if (hg_it != hgvs_by_varid.end()) {
-            hgvs_nuc = join_semicolon(hg_it->second.nuc);
+            hgvs_nuc  = join_semicolon(hg_it->second.nuc);
             hgvs_prot = join_semicolon(hg_it->second.prot);
             if (!hg_it->second.prot.empty()) primary_hgvsp = hg_it->second.prot.front();
         }
 
-        std::string gnomad_af;
+        std::string gnomad_af = "";
         auto g_it = gnomad_by_coord.find(key);
         if (g_it != gnomad_by_coord.end()) gnomad_af = g_it->second.af;
 
         std::string cosmic_ids, cosmic_site, cosmic_hist, cosmic_count;
         auto c_it = cosmic_by_coord.find(key);
         if (c_it != cosmic_by_coord.end()) {
-            cosmic_ids = c_it->second.ids;
-            cosmic_site = c_it->second.primary_site;
-            cosmic_hist = c_it->second.histology;
+            cosmic_ids   = c_it->second.ids;
+            cosmic_site  = c_it->second.primary_site;
+            cosmic_hist  = c_it->second.histology;
             cosmic_count = c_it->second.count;
         }
 
@@ -658,10 +663,10 @@ static void analyze_vcf_sclc(
         if (!primary_hgvsp.empty()) {
             auto th_it = therapy_by_hgvsp.find(primary_hgvsp);
             if (th_it != therapy_by_hgvsp.end()) {
-                th_level = th_it->second.evidence_level;
-                th_drug = th_it->second.drug;
+                th_level   = th_it->second.evidence_level;
+                th_drug    = th_it->second.drug;
                 th_disease = th_it->second.disease;
-                th_source = th_it->second.source;
+                th_source  = th_it->second.source;
             }
         }
 
@@ -669,7 +674,7 @@ static void analyze_vcf_sclc(
             << chrom << "\t"
             << pos << "\t"
             << ref << "\t"
-            << alt << "\t"
+            << alt_allele << "\t"
             << rec.variation_id << "\t"
             << rec.allele_id << "\t"
             << rec.gene_symbol << "\t"
@@ -694,11 +699,10 @@ static void analyze_vcf_sclc(
     }
 }
 
-// ==================== TRYB GLOBAL ====================
+// ==================== Tryb globalny: zrzut ClinVar+HGVS ====================
 
 static void dump_global(const std::unordered_map<std::string, ClinVarRecord>& clinvar_by_coord,
-    const std::unordered_map<std::string, HgvsInfo>& hgvs_by_varid)
-{
+                        const std::unordered_map<std::string, HgvsInfo>& hgvs_by_varid) {
     std::cout
         << "VariationID\tAlleleID\tGeneSymbol\tClinicalSignificance\tOrigin\tPhenotype\tChrom\tPos\tRef\tAlt\tHGVS_NUC\tHGVS_PROT\n";
 
@@ -708,7 +712,7 @@ static void dump_global(const std::unordered_map<std::string, ClinVarRecord>& cl
         auto hg_it = hgvs_by_varid.find(rec.variation_id);
         std::string hgvs_nuc, hgvs_prot;
         if (hg_it != hgvs_by_varid.end()) {
-            hgvs_nuc = join_semicolon(hg_it->second.nuc);
+            hgvs_nuc  = join_semicolon(hg_it->second.nuc);
             hgvs_prot = join_semicolon(hg_it->second.prot);
         }
 
@@ -728,67 +732,83 @@ static void dump_global(const std::unordered_map<std::string, ClinVarRecord>& cl
     }
 }
 
-// ==================== MAIN ====================
+// ==================== main ====================
 
 int main(int argc, char* argv[]) {
     if (argc < 6 || argc > 10) {
         std::cerr
             << "Usage:\n"
-            << "  " << argv[0] << " sclc   sample.vcf[.gz] variant_summary.txt[.gz] hgvs4variation.txt[.gz] variation_allele.txt[.gz] [gnomad.tsv] [cosmic.tsv] [tp53db.tsv] [therapy.tsv]\n"
-            << "  " << argv[0] << " global dummy.vcf      variant_summary.txt[.gz] hgvs4variation.txt[.gz] variation_allele.txt[.gz]\n";
+            << "  " << argv[0] << " sclc   sample.vcf[.gz] variant_summary.txt[.gz] hgvs4variation.txt[.gz] variation_allele.txt[.gz]"
+            << " [gnomad.tsv[.gz]] [cosmic.tsv[.gz]] [tp53db.tsv[.gz]] [therapy.tsv[.gz]]\n"
+            << "  " << argv[0] << " global dummy.vcf      variant_summary.txt[.gz] hgvs4variation.txt[.gz] variation_allele.txt[.gz]"
+            << " [gnomad.tsv[.gz]] [cosmic.tsv[.gz]] [tp53db.tsv[.gz]] [therapy.tsv[.gz]]\n\n"
+            << "If you don't want to use a given extra database, pass '-' instead of a filename.\n";
+        return 1;
+    }
+
+    std::string mode         = argv[1];
+    std::string vcf_path     = argv[2];
+    std::string var_summary  = argv[3];
+    std::string hgvs_path    = argv[4];
+    std::string var_allele   = argv[5];
+
+    std::string gnomad_path  = (argc > 6) ? argv[6] : "-";
+    std::string cosmic_path  = (argc > 7) ? argv[7] : "-";
+    std::string tp53db_path  = (argc > 8) ? argv[8] : "-";
+    std::string therapy_path = (argc > 9) ? argv[9] : "-";
+
+    bool sclc_mode = false;
+    if (mode == "sclc") sclc_mode = true;
+    else if (mode == "global") sclc_mode = false;
+    else {
+        std::cerr << "ERROR: mode must be 'sclc' or 'global'\n";
         return 1;
     }
 
     try {
-        std::string mode = argv[1];
-        bool sclc_mode = (mode == "sclc");
+        std::cerr << "Loading VariationID -> AlleleID from " << var_allele << " ...\n";
+        auto varid_to_alleleid = load_variation_allele(var_allele);
+        std::cerr << "Loaded " << varid_to_alleleid.size() << " VariationID-AlleleID pairs\n";
 
-        std::string vcf_path = argv[2];
-        std::string variant_summary_path = argv[3];
-        std::string hgvs4variation_path = argv[4];
-        std::string variation_allele_path = argv[5];
+        std::cerr << "Loading ClinVar records from " << var_summary << " (mode=" << mode << ")...\n";
+        auto clinvar_by_coord = load_clinvar_filtered(var_summary, varid_to_alleleid, sclc_mode);
+        std::cerr << "Loaded " << clinvar_by_coord.size() << " ClinVar records after filtering\n";
 
-        std::string gnomad_path = (argc > 6) ? argv[6] : "-";
-        std::string cosmic_path = (argc > 7) ? argv[7] : "-";
-        std::string tp53db_path = (argc > 8) ? argv[8] : "-";
-        std::string therapy_path = (argc > 9) ? argv[9] : "-";
+        std::unordered_set<std::string> varids;
+        varids.reserve(clinvar_by_coord.size());
+        for (const auto& kv : clinvar_by_coord) varids.insert(kv.second.variation_id);
 
-        auto varid_to_alleleid = load_variation_allele(variation_allele_path);
+        std::cerr << "Loading HGVS info from " << hgvs_path << " ...\n";
+        auto hgvs_by_varid = load_hgvs_for_variants(hgvs_path, varids);
+        std::cerr << "Loaded HGVS for " << hgvs_by_varid.size() << " VariationIDs\n";
 
-        auto clinvar_by_coord = load_clinvar_filtered(
-            variant_summary_path,
-            varid_to_alleleid,
-            sclc_mode
-        );
-
-        std::unordered_set<std::string> wanted_variation_ids;
-        wanted_variation_ids.reserve(clinvar_by_coord.size());
-        for (const auto& kv : clinvar_by_coord) wanted_variation_ids.insert(kv.second.variation_id);
-
-        auto hgvs_by_varid = load_hgvs_for_variants(hgvs4variation_path, wanted_variation_ids);
-
+        std::cerr << "Loading gnomAD from " << gnomad_path << " ...\n";
         auto gnomad_by_coord = load_gnomad(gnomad_path);
+        std::cerr << "Loaded " << gnomad_by_coord.size() << " gnomAD records\n";
+
+        std::cerr << "Loading COSMIC from " << cosmic_path << " ...\n";
         auto cosmic_by_coord = load_cosmic(cosmic_path);
+        std::cerr << "Loaded " << cosmic_by_coord.size() << " COSMIC records\n";
+
+        std::cerr << "Loading TP53 functional DB from " << tp53db_path << " ...\n";
         auto tp53_by_hgvsp = load_tp53db(tp53db_path);
+        std::cerr << "Loaded " << tp53_by_hgvsp.size() << " TP53 functional records\n";
+
+        std::cerr << "Loading therapy DB (OncoKB/CIViC) from " << therapy_path << " ...\n";
         auto therapy_by_hgvsp = load_therapy(therapy_path);
+        std::cerr << "Loaded " << therapy_by_hgvsp.size() << " therapy records\n";
 
         if (sclc_mode) {
-            analyze_vcf_sclc(
-                vcf_path,
-                clinvar_by_coord,
-                hgvs_by_varid,
-                gnomad_by_coord,
-                cosmic_by_coord,
-                tp53_by_hgvsp,
-                therapy_by_hgvsp
-            );
-        }
-        else {
+            std::cerr << "Analyzing VCF: " << vcf_path << " ...\n";
+            analyze_vcf_sclc(vcf_path, clinvar_by_coord, hgvs_by_varid,
+                             gnomad_by_coord, cosmic_by_coord, tp53_by_hgvsp, therapy_by_hgvsp);
+        } else {
+            std::cerr << "Dumping global ClinVar+HGVS table...\n";
             dump_global(clinvar_by_coord, hgvs_by_varid);
         }
 
-    }
-    catch (const std::exception& ex) {
+        std::cerr << "Done.\n";
+    } catch (const std::exception& ex) {
         std::cerr << "EXCEPTION: " << ex.what() << "\n";
         return 1;
     }
