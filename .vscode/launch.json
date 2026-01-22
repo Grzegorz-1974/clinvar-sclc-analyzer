@@ -1,0 +1,50 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run clinvar_tool (global)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/clinvar_tool",
+      "args": [
+        "global",
+        "dummy.vcf",
+        "variant_summary.txt.gz",
+        "hgvs4variation.txt.gz",
+        "variation_allele.txt.gz"
+      ],
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "CMake: build (Debug)",
+      "setupCommands": [
+        { "description": "Enable pretty printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "Run clinvar_tool (sclc)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/clinvar_tool",
+      "args": [
+        "sclc",
+        "sample.vcf",
+        "variant_summary.txt.gz",
+        "hgvs4variation.txt.gz",
+        "variation_allele.txt.gz",
+        "-",
+        "-",
+        "-",
+        "-"
+      ],
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "CMake: build (Debug)"
+    }
+  ]
+}
